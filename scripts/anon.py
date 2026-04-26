@@ -39,6 +39,14 @@ USER_AGENT = (
 )
 CURL_TIMEOUT = 60   # Tor circuit setup can take 10-15s; total budget per request
 
+# DuckDuckGo: prefer the onion (search traffic stays inside Tor — no exit relay
+# sees the query); fall back to the clearnet HTML mirror over Tor if the onion
+# is unreachable. Both routes are full-Tor; no privacy regression on fallback.
+DDG_ONION = (
+    "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
+)
+DDG_CLEARNET = "https://html.duckduckgo.com/html/"
+
 
 # ---------------------------------------------------------------- helpers ----
 
@@ -465,37 +473,64 @@ def cmd_status(args) -> int:
 
 # ---------------------------------------------------------------- search ----
 
+def _ddg_search(query: str) -> tuple[list[dict], list[str]]:
+    """Run a DuckDuckGo HTML search through Tor.
+
+    Tries the .onion service first (search traffic stays inside the Tor
+    network — no exit relay sees the query), then falls back to the clearnet
+    HTML mirror over Tor on connection errors, blocks, or empty/garbled
+    responses. Both routes go through Tor, so falling back to clearnet does
+    NOT leak your IP — only switches which path inside Tor is used.
+
+    Returns (results, errors). On success errors is []; on full failure
+    results is [] and errors lists what went wrong with each route.
+    """
+    data = urllib.parse.urlencode({"q": query, "kl": "us-en"})
+    errors: list[str] = []
+    for label, url in (("onion", DDG_ONION), ("clearnet", DDG_CLEARNET)):
+        try:
+            status, headers, body = _curl(url, method="POST", data=data)
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+            continue
+
+        block = _detect_block(status, headers, body)
+        if block:
+            errors.append(f"{label}: blocked ({block})")
+            continue
+        if status >= 400 or not body:
+            errors.append(f"{label}: HTTP {status}, body {len(body)} bytes")
+            continue
+
+        text = body.decode("utf-8", "replace")
+        results = _parse_ddg(text)
+        if results:
+            return results, []
+        # parsed empty — could be legitimately no-results, or HTML changed
+        if "no results" in text.lower():
+            return [], []  # no results, but the query worked
+        errors.append(f"{label}: no results parsed (HTML may have changed)")
+
+    return [], errors
+
+
 def cmd_search(args) -> int:
     _ensure_tor_or_die()
-    data = urllib.parse.urlencode({"q": args.query, "kl": "us-en"})
-    try:
-        status, headers, body = _curl(
-            "https://html.duckduckgo.com/html/",
-            method="POST",
-            data=data,
-        )
-    except Exception as e:
-        print(f"ERROR: search request failed: {e}", file=sys.stderr)
-        return 1
 
-    block = _detect_block(status, headers, body)
-    if block:
-        print(f"BLOCKED: DuckDuckGo blocked Tor exit ({block}). "
-              "Re-run to roll a new circuit, or try again later.",
+    results, errors = _ddg_search(args.query)
+    if errors and not results:
+        print("BLOCKED/ERROR: DuckDuckGo search failed on every route:",
+              file=sys.stderr)
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        print("Re-run to roll new circuits, or try again later.",
               file=sys.stderr)
         return 2
 
-    text = body.decode("utf-8", "replace")
-    results = _parse_ddg(text)[: args.limit]
+    results = results[: args.limit]
     if not results:
-        # Could be: empty query result, or DDG HTML structure changed
-        if "no results" in text.lower():
-            print("(no results)")
-            return 0
-        print("ERROR: no results parsed. DDG HTML structure may have changed; "
-              "first 500 chars of response follow:", file=sys.stderr)
-        print(text[:500], file=sys.stderr)
-        return 1
+        print("(no results)")
+        return 0
 
     if args.json:
         print(json.dumps(results, indent=2))

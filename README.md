@@ -93,7 +93,7 @@ Detects platform, installs Tor if missing (`brew install tor` on macOS; prints `
 Makes two requests to `check.torproject.org/api/ip` with different SOCKS auth and prints both IPs. Both must say `IsTor: true` **and the IPs must differ** — that's the proof your two requests aren't correlatable by exit IP.
 
 ### `search QUERY [--limit N] [--json]`
-DuckDuckGo HTML search through Tor. Returns markdown list of `{title, url, snippet}` — or JSON with `--json`.
+DuckDuckGo HTML search through Tor. Tries DDG's `.onion` service first (search traffic stays inside the Tor network — *no exit relay sees your query*) and falls back to the clearnet HTML mirror over Tor if the onion is unreachable. Both routes are full-Tor; the fallback isn't a privacy regression. Returns markdown list of `{title, url, snippet}` — or JSON with `--json`.
 
 ### `fetch URL [--format markdown|text|html]`
 GETs URL through Tor with a fresh circuit. Default output is readable markdown.

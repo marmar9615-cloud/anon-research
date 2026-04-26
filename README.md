@@ -92,8 +92,25 @@ Detects platform, installs Tor if missing (`brew install tor` on macOS; prints `
 ### `status`
 Makes two requests to `check.torproject.org/api/ip` with different SOCKS auth and prints both IPs. Both must say `IsTor: true` **and the IPs must differ** — that's the proof your two requests aren't correlatable by exit IP.
 
-### `search QUERY [--limit N] [--json]`
-DuckDuckGo HTML search through Tor. Tries DDG's `.onion` service first (search traffic stays inside the Tor network — *no exit relay sees your query*) and falls back to the clearnet HTML mirror over Tor if the onion is unreachable. Both routes are full-Tor; the fallback isn't a privacy regression. Returns markdown list of `{title, url, snippet}` — or JSON with `--json`.
+### `search QUERY [--limit N] [--json] [--engine ddg|searx]`
+Search the web through Tor. Default engine is DuckDuckGo: tries DDG's `.onion` service first (search traffic stays inside the Tor network — *no exit relay sees your query*) and falls back to the clearnet HTML mirror over Tor if the onion is unreachable. Both routes are full-Tor; the fallback isn't a privacy regression. Returns markdown list of `{title, url, snippet}` — or JSON with `--json`.
+
+Pass `--engine searx` to use a SearXNG instance instead — see [Search engines](#search-engines) below.
+
+### Search engines
+
+**`--engine ddg`** (default) — DuckDuckGo. Onion-first with clearnet-over-Tor fallback. Works out of the box.
+
+**`--engine searx`** — SearXNG. **Bring your own instance:** point `ANON_SEARX_URL` at it.
+
+```bash
+export ANON_SEARX_URL=https://my-searx.example.com
+~/.claude/skills/anon-research/scripts/anon.py search "..." --engine searx
+```
+
+Why BYO: every public SearXNG instance we tested in 2026 (`searx.be`, `baresearch.org`, `search.inetol.net`, …) returns 403 or 429 to Tor exits. SearXNG is heavily abused for scraping so most operators rate-limit Tor traffic aggressively. If you want this fallback to work, you'll need to self-host (it's a small Docker container — see [SearXNG docs](https://docs.searxng.org/admin/installation.html)) or use one you have a relationship with.
+
+The skill talks to the instance over Tor using the JSON API (`/search?q=…&format=json`). Make sure your instance has `format: [html, json]` enabled in its `settings.yml`.
 
 ### `fetch URL [--format markdown|text|html]`
 GETs URL through Tor with a fresh circuit. Default output is readable markdown.

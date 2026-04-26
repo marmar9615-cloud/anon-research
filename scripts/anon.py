@@ -520,18 +520,79 @@ def _ddg_search(query: str) -> tuple[list[dict], list[str]]:
     return [], errors
 
 
+def _searx_search(query: str) -> list[dict]:
+    """Search a SearXNG instance over Tor using its JSON API.
+
+    Reads the instance URL from `ANON_SEARX_URL`. Public SearXNG instances
+    aggressively rate-limit Tor exits in 2026, so this is **bring-your-own**
+    (point at your own SearXNG; either self-hosted or one you have a working
+    relationship with).
+
+    Raises RuntimeError on configuration / network / parsing problems.
+    """
+    base = os.environ.get("ANON_SEARX_URL", "").strip().rstrip("/")
+    if not base:
+        raise RuntimeError(
+            "SearXNG fallback requires ANON_SEARX_URL to point at your own "
+            "SearXNG instance — public instances rate-limit Tor traffic in "
+            "2026. See README for self-hosting notes."
+        )
+
+    qs = urllib.parse.urlencode({
+        "q": query,
+        "format": "json",
+        "categories": "general",
+        "language": "en",
+    })
+    url = f"{base}/search?{qs}"
+    status, headers, body = _curl(url)
+
+    block = _detect_block(status, headers, body)
+    if block:
+        raise RuntimeError(f"SearXNG instance blocked Tor exit ({block})")
+    if status >= 400:
+        raise RuntimeError(f"SearXNG returned HTTP {status}")
+    if not body:
+        raise RuntimeError("SearXNG returned empty body")
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"SearXNG response was not JSON ({e}). Does this instance have "
+            "format=json enabled?"
+        )
+
+    out = []
+    for r in data.get("results", []):
+        out.append({
+            "title": (r.get("title") or "").strip(),
+            "url": (r.get("url") or "").strip(),
+            "snippet": (r.get("content") or "").strip(),
+        })
+    return out
+
+
 def cmd_search(args) -> int:
     _ensure_tor_or_die()
 
-    results, errors = _ddg_search(args.query)
-    if errors and not results:
-        print("BLOCKED/ERROR: DuckDuckGo search failed on every route:",
-              file=sys.stderr)
-        for e in errors:
-            print(f"  {e}", file=sys.stderr)
-        print("Re-run to roll new circuits, or try again later.",
-              file=sys.stderr)
-        return 2
+    if args.engine == "searx":
+        try:
+            results = _searx_search(args.query)
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+    else:  # default: ddg (with onion → clearnet fallback)
+        results, errors = _ddg_search(args.query)
+        if errors and not results:
+            print("BLOCKED/ERROR: DuckDuckGo search failed on every route:",
+                  file=sys.stderr)
+            for err in errors:
+                print(f"  {err}", file=sys.stderr)
+            print("Re-run to roll new circuits, or try again later "
+                  "(or try --engine searx if you have ANON_SEARX_URL set).",
+                  file=sys.stderr)
+            return 2
 
     results = results[: args.limit]
     if not results:
@@ -604,10 +665,19 @@ def main() -> None:
     )
     s.set_defaults(func=cmd_status)
 
-    s = sub.add_parser("search", help="DuckDuckGo HTML search through Tor.")
+    s = sub.add_parser("search", help="Search the web through Tor.")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=10)
     s.add_argument("--json", action="store_true")
+    s.add_argument(
+        "--engine",
+        choices=["ddg", "searx"],
+        default="ddg",
+        help=(
+            "Search engine. 'ddg' (default): DuckDuckGo onion → clearnet "
+            "fallback. 'searx': your own SearXNG instance via ANON_SEARX_URL."
+        ),
+    )
     s.set_defaults(func=cmd_search)
 
     s = sub.add_parser(

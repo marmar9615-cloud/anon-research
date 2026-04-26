@@ -318,14 +318,20 @@ def _platform() -> str:
         return ""
 
 
-def _linux_install_hint() -> str:
-    txt = ""
-    try:
-        with open("/etc/os-release") as f:
-            txt = f.read()
-    except OSError:
-        pass
-    low = txt.lower()
+def _linux_install_hint(os_release_text: str | None = None) -> str:
+    """Return the right `apt`/`dnf`/`pacman`/`apk` command for this distro.
+
+    Reads /etc/os-release by default; pass `os_release_text` to inject content
+    for testing.
+    """
+    if os_release_text is None:
+        os_release_text = ""
+        try:
+            with open("/etc/os-release") as f:
+                os_release_text = f.read()
+        except OSError:
+            pass
+    low = os_release_text.lower()
     if "id=fedora" in low or "id_like=fedora" in low or "rhel" in low:
         return "sudo dnf install -y tor"
     if "id=arch" in low or "id_like=arch" in low:

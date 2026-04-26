@@ -34,10 +34,27 @@ import urllib.parse
 
 SOCKS_HOST = "127.0.0.1"
 SOCKS_PORT = 9050
+CONTROL_HOST = "127.0.0.1"
+CONTROL_PORT = 9051
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
 CURL_TIMEOUT = 60   # Tor circuit setup can take 10-15s; total budget per request
+
+# Control-port cookie path written by the enable-control-port subcommand.
+# Tor will create this file when the daemon starts with CookieAuthFile set.
+CONTROL_COOKIE_PATHS = [
+    "/opt/homebrew/var/lib/tor/control_auth_cookie",   # Apple-silicon brew
+    "/usr/local/var/lib/tor/control_auth_cookie",      # Intel macOS brew
+    "/var/lib/tor/control_auth_cookie",                # Linux system tor
+]
+
+# torrc paths we know about. Used by enable-control-port.
+TORRC_PATHS = [
+    "/opt/homebrew/etc/tor/torrc",
+    "/usr/local/etc/tor/torrc",
+    "/etc/tor/torrc",
+]
 
 # DuckDuckGo: prefer the onion (search traffic stays inside Tor — no exit relay
 # sees the query); fall back to the clearnet HTML mirror over Tor if the onion
@@ -147,6 +164,155 @@ def _curl(
                 os.unlink(path)
             except OSError:
                 pass
+
+
+# ----------------------------------------------------- control-port (Tor) ---
+#
+# These helpers talk to Tor's control protocol so we can do things SOCKS5
+# can't — most importantly, constrain a circuit to a specific exit country
+# via SETCONF ExitNodes={cc}. The control port is opt-in: it's only enabled
+# after the user runs `enable-control-port` once, which writes a torrc and
+# restarts the daemon.
+
+def _control_port_open() -> bool:
+    try:
+        with socket.create_connection((CONTROL_HOST, CONTROL_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def _find_control_cookie() -> str | None:
+    for path in CONTROL_COOKIE_PATHS:
+        if os.path.exists(path) and os.access(path, os.R_OK):
+            return path
+    return None
+
+
+class _TorControl:
+    """Minimal Tor control-port client. Cookie-auth only.
+
+    Use as a context manager — `with _TorControl() as c: c.setconf(...)`.
+    Wraps a stdlib socket. No dependencies.
+    """
+
+    def __init__(self):
+        self.sock: socket.socket | None = None
+
+    def __enter__(self) -> "_TorControl":
+        cookie_path = _find_control_cookie()
+        if not cookie_path:
+            raise RuntimeError(
+                "No Tor control_auth_cookie found. Run "
+                "`scripts/anon.py enable-control-port` to set it up."
+            )
+        with open(cookie_path, "rb") as f:
+            cookie = f.read()
+        s = socket.create_connection((CONTROL_HOST, CONTROL_PORT), timeout=10)
+        s.settimeout(10)
+        s.sendall(b"AUTHENTICATE " + cookie.hex().encode() + b"\r\n")
+        resp = self._recv_line(s)
+        if not resp.startswith("250"):
+            s.close()
+            raise RuntimeError(f"Tor control auth failed: {resp.strip()!r}")
+        self.sock = s
+        return self
+
+    def __exit__(self, *args):
+        if self.sock:
+            try:
+                self.sock.sendall(b"QUIT\r\n")
+            except OSError:
+                pass
+            self.sock.close()
+            self.sock = None
+
+    def _recv_line(self, s: socket.socket | None = None) -> str:
+        s = s or self.sock
+        assert s is not None
+        buf = bytearray()
+        while True:
+            ch = s.recv(1)
+            if not ch:
+                break
+            buf.extend(ch)
+            if buf.endswith(b"\r\n"):
+                break
+        return buf.decode("utf-8", "replace")
+
+    def _command(self, cmd: str) -> str:
+        assert self.sock is not None
+        self.sock.sendall((cmd + "\r\n").encode())
+        resp = self._recv_line()
+        if not resp.startswith("250"):
+            raise RuntimeError(f"Tor control command failed: {cmd!r} -> {resp.strip()!r}")
+        return resp
+
+    def setconf(self, key: str, value: str) -> None:
+        self._command(f"SETCONF {key}={value}")
+
+    def resetconf(self, key: str) -> None:
+        self._command(f"RESETCONF {key}")
+
+    def signal(self, sig: str) -> None:
+        self._command(f"SIGNAL {sig}")
+
+
+def _validate_country_code(cc: str) -> str:
+    cc = cc.strip().lower()
+    if not re.match(r"^[a-z]{2}$", cc):
+        raise ValueError(
+            f"Invalid country code {cc!r}: expected a 2-letter ISO code "
+            "like 'us', 'gb', 'de', 'ca'."
+        )
+    return cc
+
+
+class _exit_country:
+    """Context manager: pin Tor's exit-node selection to one country, then
+    reset on exit. Requires the control port to be configured.
+
+    No-op when `country` is None (so callers can wrap unconditionally).
+    """
+
+    def __init__(self, country: str | None):
+        self.country = country
+        self.ctrl: _TorControl | None = None
+
+    def __enter__(self):
+        if not self.country:
+            return self
+        if not _control_port_open():
+            raise RuntimeError(
+                "--exit-country requires Tor's control port. Run "
+                "`scripts/anon.py enable-control-port` once to set it up."
+            )
+        cc = _validate_country_code(self.country)
+        self.ctrl = _TorControl().__enter__()
+        try:
+            self.ctrl.setconf("ExitNodes", "{" + cc + "}")
+            # StrictNodes makes Tor refuse to fall back to other countries
+            # if the requested pool is empty — fail-closed instead of leaking
+            # to a different geo than the user asked for.
+            self.ctrl.setconf("StrictNodes", "1")
+            # NEWNYM forces *new* circuits to be built that obey the new
+            # ExitNodes setting; existing cached circuits are abandoned.
+            self.ctrl.signal("NEWNYM")
+        except Exception:
+            self.ctrl.__exit__(None, None, None)
+            self.ctrl = None
+            raise
+        return self
+
+    def __exit__(self, *args):
+        if self.ctrl is not None:
+            for key in ("ExitNodes", "StrictNodes"):
+                try:
+                    self.ctrl.resetconf(key)
+                except Exception:
+                    pass
+            self.ctrl.__exit__(*args)
+            self.ctrl = None
 
 
 # -------------------------------------------------------- block detection ---
@@ -435,6 +601,162 @@ def cmd_setup(args) -> int:
         return 1
 
 
+# ---------------------------------------------- enable-control-port (opt-in) -
+
+_TORRC_BLOCK_MARKER = "# Added by anon-research enable-control-port"
+
+_TORRC_BLOCK = """
+{marker}
+ControlPort {port}
+CookieAuthentication 1
+CookieAuthFile {cookie}
+CookieAuthFileGroupReadable 1
+"""
+
+
+def _find_or_choose_torrc() -> str | None:
+    """Return existing torrc path, else the path we'd create on this platform."""
+    for p in TORRC_PATHS:
+        if os.path.exists(p):
+            return p
+    sys_name = _platform()
+    if sys_name == "Darwin":
+        # Apple Silicon brew vs. Intel brew
+        if os.path.exists("/opt/homebrew"):
+            return "/opt/homebrew/etc/tor/torrc"
+        if os.path.exists("/usr/local/Homebrew") or os.path.exists("/usr/local/opt"):
+            return "/usr/local/etc/tor/torrc"
+    elif sys_name == "Linux":
+        return "/etc/tor/torrc"
+    return None
+
+
+def _cookie_path_for_torrc(torrc_path: str) -> str:
+    """Pick a CookieAuthFile path that matches where Tor stores its data."""
+    if torrc_path.startswith("/opt/homebrew/"):
+        return "/opt/homebrew/var/lib/tor/control_auth_cookie"
+    if torrc_path.startswith("/usr/local/"):
+        return "/usr/local/var/lib/tor/control_auth_cookie"
+    return "/var/lib/tor/control_auth_cookie"
+
+
+def cmd_enable_control_port(args) -> int:
+    """Idempotent: enable Tor's ControlPort + CookieAuthentication and restart Tor.
+
+    Required once before --exit-country can be used. Modifies the system's
+    torrc — that's why this is opt-in instead of being part of `setup`.
+    """
+    torrc = _find_or_choose_torrc()
+    if torrc is None:
+        print(
+            "ERROR: Could not find a torrc location for this platform.\n"
+            "Edit your torrc by hand to add:\n"
+            "  ControlPort 9051\n"
+            "  CookieAuthentication 1\n"
+            "  CookieAuthFile /var/lib/tor/control_auth_cookie\n"
+            "  CookieAuthFileGroupReadable 1\n"
+            "Then restart Tor.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"==> Using torrc: {torrc}", flush=True)
+    existing = ""
+    if os.path.exists(torrc):
+        try:
+            with open(torrc) as f:
+                existing = f.read()
+        except OSError as e:
+            print(f"ERROR: cannot read {torrc}: {e}", file=sys.stderr)
+            return 1
+
+    if "ControlPort" in existing and _TORRC_BLOCK_MARKER not in existing:
+        print(
+            f"ERROR: {torrc} already has a ControlPort directive that anon-research "
+            "didn't write. Refusing to touch it. Inspect your torrc by hand.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if _TORRC_BLOCK_MARKER in existing:
+        print("    torrc already has the anon-research block — no changes needed.")
+    else:
+        cookie = _cookie_path_for_torrc(torrc)
+        block = _TORRC_BLOCK.format(
+            marker=_TORRC_BLOCK_MARKER,
+            port=CONTROL_PORT,
+            cookie=cookie,
+        )
+        # Make sure parent dirs exist
+        os.makedirs(os.path.dirname(torrc), exist_ok=True)
+        os.makedirs(os.path.dirname(cookie), exist_ok=True)
+        sep = "" if existing.endswith("\n") or not existing else "\n"
+        try:
+            with open(torrc, "a") as f:
+                f.write(sep + block)
+        except PermissionError:
+            print(
+                f"ERROR: permission denied writing {torrc}. On Linux you may "
+                f"need to run this command with sudo, or edit torrc by hand.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"    appended ControlPort + CookieAuthentication block to {torrc}")
+
+    # Restart Tor so the new torrc takes effect
+    print("==> Restarting Tor…", flush=True)
+    sys_name = _platform()
+    if sys_name == "Darwin" and shutil.which("brew"):
+        r = subprocess.run(["brew", "services", "restart", "tor"])
+        if r.returncode != 0:
+            print("ERROR: 'brew services restart tor' failed.", file=sys.stderr)
+            return 1
+    elif sys_name == "Linux":
+        print(
+            "Restart Tor manually:\n"
+            "  sudo systemctl restart tor\n"
+            "Then re-run this command to verify.",
+            file=sys.stderr,
+        )
+        return 1
+    else:
+        print(
+            "Don't know how to restart Tor on this platform — restart it "
+            "yourself, then re-run.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("==> Waiting for control port…", flush=True)
+    for _ in range(30):
+        if _control_port_open() and _find_control_cookie():
+            break
+        time.sleep(1)
+    if not _control_port_open():
+        print(
+            f"ERROR: control port {CONTROL_PORT} still not reachable after 30s.",
+            file=sys.stderr,
+        )
+        return 1
+    if not _find_control_cookie():
+        print(
+            "ERROR: control port is open but cookie file isn't where we expect.\n"
+            f"Looked in: {', '.join(CONTROL_COOKIE_PATHS)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Probe with an actual auth round-trip.
+    try:
+        with _TorControl():
+            pass
+        print("    OK. Control port authenticated. --exit-country is now usable.")
+        return 0
+    except Exception as e:
+        print(f"ERROR: control-port authentication failed: {e}", file=sys.stderr)
+        return 1
+
+
 # ---------------------------------------------------------------- status ----
 
 def cmd_status(args) -> int:
@@ -576,23 +898,28 @@ def _searx_search(query: str) -> list[dict]:
 def cmd_search(args) -> int:
     _ensure_tor_or_die()
 
-    if args.engine == "searx":
-        try:
-            results = _searx_search(args.query)
-        except Exception as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 2
-    else:  # default: ddg (with onion → clearnet fallback)
-        results, errors = _ddg_search(args.query)
-        if errors and not results:
-            print("BLOCKED/ERROR: DuckDuckGo search failed on every route:",
-                  file=sys.stderr)
-            for err in errors:
-                print(f"  {err}", file=sys.stderr)
-            print("Re-run to roll new circuits, or try again later "
-                  "(or try --engine searx if you have ANON_SEARX_URL set).",
-                  file=sys.stderr)
-            return 2
+    try:
+        with _exit_country(getattr(args, "exit_country", None)):
+            if args.engine == "searx":
+                try:
+                    results = _searx_search(args.query)
+                except Exception as e:
+                    print(f"ERROR: {e}", file=sys.stderr)
+                    return 2
+            else:  # default: ddg (with onion → clearnet fallback)
+                results, errors = _ddg_search(args.query)
+                if errors and not results:
+                    print("BLOCKED/ERROR: DuckDuckGo search failed on every route:",
+                          file=sys.stderr)
+                    for err in errors:
+                        print(f"  {err}", file=sys.stderr)
+                    print("Re-run to roll new circuits, or try again later "
+                          "(or try --engine searx if you have ANON_SEARX_URL set).",
+                          file=sys.stderr)
+                    return 2
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     results = results[: args.limit]
     if not results:
@@ -616,7 +943,11 @@ def cmd_search(args) -> int:
 def cmd_fetch(args) -> int:
     _ensure_tor_or_die()
     try:
-        status, headers, body = _curl(args.url, max_size=10_000_000)
+        with _exit_country(getattr(args, "exit_country", None)):
+            status, headers, body = _curl(args.url, max_size=10_000_000)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"ERROR: fetch failed: {e}", file=sys.stderr)
         return 1
@@ -660,6 +991,12 @@ def main() -> None:
     s.set_defaults(func=cmd_setup)
 
     s = sub.add_parser(
+        "enable-control-port",
+        help="One-time opt-in: enable Tor's control port for --exit-country.",
+    )
+    s.set_defaults(func=cmd_enable_control_port)
+
+    s = sub.add_parser(
         "status",
         help="Check Tor + show two different exit IPs (proves circuit isolation).",
     )
@@ -678,6 +1015,15 @@ def main() -> None:
             "fallback. 'searx': your own SearXNG instance via ANON_SEARX_URL."
         ),
     )
+    s.add_argument(
+        "--exit-country",
+        metavar="CC",
+        help=(
+            "Two-letter ISO country code (e.g. 'us', 'gb', 'de'). Constrains "
+            "Tor's exit relay to that country. Requires running "
+            "`enable-control-port` once."
+        ),
+    )
     s.set_defaults(func=cmd_search)
 
     s = sub.add_parser(
@@ -689,6 +1035,15 @@ def main() -> None:
         "--format",
         choices=["markdown", "text", "html"],
         default="markdown",
+    )
+    s.add_argument(
+        "--exit-country",
+        metavar="CC",
+        help=(
+            "Two-letter ISO country code (e.g. 'us', 'gb', 'de'). Constrains "
+            "Tor's exit relay to that country. Requires running "
+            "`enable-control-port` once."
+        ),
     )
     s.set_defaults(func=cmd_fetch)
 

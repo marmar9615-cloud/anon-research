@@ -89,6 +89,9 @@ Or just talk to Claude — phrases like *"search anonymously for X"*, *"private 
 ### `setup`
 Detects platform, installs Tor if missing (`brew install tor` on macOS; prints `apt`/`dnf`/`pacman` hint on Linux; otherwise links to https://www.torproject.org/download/), starts the daemon, verifies connectivity. Idempotent — safe to re-run.
 
+### `enable-control-port` *(opt-in, advanced)*
+Adds `ControlPort 9051` and `CookieAuthentication 1` to your Tor config and restarts Tor. Required once before `--exit-country` works. Idempotent — running twice is a no-op. See [Exit country (advanced)](#exit-country-advanced).
+
 ### `status`
 Makes two requests to `check.torproject.org/api/ip` with different SOCKS auth and prints both IPs. Both must say `IsTor: true` **and the IPs must differ** — that's the proof your two requests aren't correlatable by exit IP.
 
@@ -112,8 +115,32 @@ Why BYO: every public SearXNG instance we tested in 2026 (`searx.be`, `baresearc
 
 The skill talks to the instance over Tor using the JSON API (`/search?q=…&format=json`). Make sure your instance has `format: [html, json]` enabled in its `settings.yml`.
 
-### `fetch URL [--format markdown|text|html]`
-GETs URL through Tor with a fresh circuit. Default output is readable markdown.
+### Exit country (advanced)
+
+`--exit-country CC` constrains Tor's exit relay to a specific country, useful for geo-restricted research (UK news paywalls, EU-only studies, regional pricing pages, etc.). Pass a 2-letter ISO code: `us`, `gb`, `de`, `ca`, `nl`, `jp`, …
+
+```bash
+anon.py search "regional news" --exit-country gb
+anon.py fetch  https://example.com/region-locked --exit-country de
+```
+
+This requires Tor's control port. Enable it once:
+
+```bash
+~/.claude/skills/anon-research/scripts/anon.py enable-control-port
+```
+
+That subcommand:
+- Locates your `torrc` (`/opt/homebrew/etc/tor/torrc` on Apple-silicon brew, `/usr/local/etc/tor/torrc` on Intel brew, `/etc/tor/torrc` on Linux),
+- Appends `ControlPort 9051`, `CookieAuthentication 1`, `CookieAuthFile <path>`, `CookieAuthFileGroupReadable 1`,
+- Restarts Tor and verifies cookie-auth round-trips.
+
+It's idempotent: re-running it is a no-op once the block is in place. If you've already configured a `ControlPort` yourself, the subcommand refuses to touch your torrc — open it and add `CookieAuthentication 1` by hand.
+
+Implementation: per call, `anon.py` opens a control connection, issues `SETCONF ExitNodes={CC}`, `SETCONF StrictNodes 1`, `SIGNAL NEWNYM`, runs the request, and `RESETCONF`s both keys on exit. **Single-process serial use only** — running two `anon.py` invocations concurrently with different `--exit-country` values will race on the global `ExitNodes` setting, since it's set per-Tor-instance.
+
+### `fetch URL [--format markdown|text|html] [--exit-country CC]`
+GETs URL through Tor with a fresh circuit. Default output is readable markdown. Pass `--exit-country` to constrain the exit relay to a specific country (see below).
 
 If the fetch hits a Tor block (Cloudflare challenge, HTTP 403/429/451, common captcha bodies), it prints `BLOCKED:` with the reason and exits 2 — **never silently falls back to clearnet**. Silent fallback would deanonymize you.
 
